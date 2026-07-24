@@ -8,11 +8,13 @@ Developed by raremore at RE:CODER Labs.
 
 - 동일 호스트의 내부 링크 수집
 - 추적 파라미터 제거 및 중복 URL 정리
-- `noindex`, 외부 canonical, 오류 페이지 제외
+- meta robots와 `X-Robots-Tag`의 `noindex` 페이지 제외
+- 외부 canonical과 오류 페이지 제외
 - 관리자, 회원, 주문 및 정적 파일 경로 자동 제외
-- 제외 URL, 오류 URL, 리다이렉트, canonical 불일치 CSV 생성
-- URL이 45,000개를 초과하면 여러 sitemap 파일과 sitemap index로 자동 분할
-- `robots.txt` 규칙 적용
+- 실제 HTTP 상태 코드가 포함된 리다이렉트 이력 CSV 생성
+- 제외 URL, 오류 URL, canonical 불일치 CSV 생성
+- URL 개수 또는 파일 용량이 제한에 가까워지면 sitemap 자동 분할
+- `robots.txt`와 `Crawl-delay` 규칙 적용
 
 ## 요구 사항
 
@@ -77,14 +79,14 @@ python sitemap_generator.py https://www.example.com/ --output result
 # 최대 방문 페이지와 동시 요청 수 변경
 python sitemap_generator.py https://www.example.com/ --max-pages 10000 --workers 5
 
+# 전체 HTTP 요청 사이의 최소 간격 변경
+python sitemap_generator.py https://www.example.com/ --delay 0.2
+
 # 추가 제외 경로
 python sitemap_generator.py https://www.example.com/ --exclude /event/ --exclude /promotion/
 
 # robots.txt 규칙 무시
 python sitemap_generator.py https://www.example.com/ --ignore-robots
-
-# 하위 도메인도 내부 URL로 처리
-python sitemap_generator.py https://www.example.com/ --allow-subdomains
 
 # page 파라미터가 있는 페이지네이션 URL도 사이트맵에 포함
 python sitemap_generator.py https://www.example.com/ --include-page-urls
@@ -128,6 +130,7 @@ python sitemap_generator.py --help
 
 - JavaScript로만 노출되는 링크는 수집되지 않을 수 있습니다.
 - 로그인 후에만 보이는 페이지는 수집하지 않습니다.
+- 한 sitemap에는 하나의 호스트만 포함되므로 하위 도메인은 별도로 실행해야 합니다.
 - 사이트 서버에 부담을 주지 않도록 동시 요청 수를 과도하게 높이지 마세요.
 - canonical이 현재 URL과 다르면 현재 URL은 사이트맵에서 제외하고 `canonical_mismatch.csv`에 기록합니다.
 - 생성한 `sitemap.xml`을 서버 루트에 업로드한 뒤 `robots.txt`의 Sitemap 주소와 일치하는지 확인하세요.

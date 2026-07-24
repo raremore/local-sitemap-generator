@@ -38,6 +38,7 @@ from urllib.parse import (
     urlsplit,
     urlunsplit,
 )
+from xml.sax.saxutils import escape as xml_escape
 from xml.etree import ElementTree as ET
 
 import requests
@@ -47,6 +48,11 @@ from urllib3.util.retry import Retry
 
 
 USER_AGENT = "LocalSitemapGenerator/1.0 (+SEO audit; local desktop tool)"
+REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+MAX_REDIRECTS = 10
+MAX_SITEMAP_URLS = 45000
+SITEMAP_CHUNK_BYTES = 45 * 1024 * 1024
+MAX_SITEMAP_BYTES = 50 * 1024 * 1024
 
 # URL 정규화 단계에서 제거할 추적/표시용 파라미터
 DROP_QUERY_KEYS = {
@@ -138,6 +144,13 @@ SKIP_PATH_PATTERNS = (
 
 
 @dataclass(slots=True)
+class RedirectHop:
+    requested_url: str
+    final_url: str
+    status_code: int
+
+
+@dataclass(slots=True)
 class FetchResult:
     requested_url: str
     final_url: str
@@ -145,6 +158,8 @@ class FetchResult:
     content_type: str
     text: str | None
     error: str | None
+    x_robots_tag: str = ""
+    redirects: tuple[RedirectHop, ...] = ()
 
 
 class SitemapCrawler:
@@ -158,7 +173,6 @@ class SitemapCrawler:
         timeout: float = 15.0,
         delay: float = 0.05,
         respect_robots: bool = True,
-        allow_subdomains: bool = False,
         include_page_urls: bool = False,
         extra_exclude_paths: Iterable[str] = (),
     ) -> None:
@@ -167,9 +181,9 @@ class SitemapCrawler:
         self.max_pages = max_pages
         self.workers = max(1, workers)
         self.timeout = timeout
-        self.delay = max(0.0, delay)
+        self.configured_delay = max(0.0, delay)
+        self.request_delay = self.configured_delay
         self.respect_robots = respect_robots
-        self.allow_subdomains = allow_subdomains
         self.include_page_urls = include_page_urls
 
         self.exclude_paths = tuple(
@@ -179,6 +193,8 @@ class SitemapCrawler:
         )
 
         self.thread_local = threading.local()
+        self.rate_lock = threading.Lock()
+        self.next_request_at = 0.0
         self.start_url = ""
         self.base_scheme = ""
         self.base_host = ""
@@ -200,6 +216,9 @@ class SitemapCrawler:
         path = path.strip()
         if not path.startswith("/"):
             path = "/" + path
+        path = re.sub(r"/{2,}", "/", path)
+        if path != "/":
+            path = path.rstrip("/")
         return path.lower()
 
     def get_session(self) -> requests.Session:
@@ -242,42 +261,127 @@ class SitemapCrawler:
             url = "https://" + url
         return url
 
-    def initialize(self) -> None:
-        candidate = self.ensure_scheme(self.original_start_url)
-        print(f"[확인] 시작 URL 연결: {candidate}")
-
-        try:
-            response = requests.get(
-                candidate,
-                headers={"User-Agent": USER_AGENT},
-                timeout=self.timeout,
-                allow_redirects=True,
-            )
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            raise RuntimeError(f"시작 URL에 연결할 수 없습니다: {exc}") from exc
-
-        final = self.normalize_url(response.url)
-        if not final:
-            raise RuntimeError("최종 시작 URL을 정규화할 수 없습니다.")
-
-        parts = urlsplit(final)
+    def set_base_url(self, url: str) -> None:
+        parts = urlsplit(url)
         if not parts.hostname:
-            raise RuntimeError("시작 URL의 호스트를 확인할 수 없습니다.")
+            raise RuntimeError("URL의 호스트를 확인할 수 없습니다.")
 
-        self.start_url = final
         self.base_scheme = parts.scheme
         self.base_host = parts.hostname.lower()
         self.base_netloc = parts.netloc.lower()
         self.origin = f"{self.base_scheme}://{self.base_netloc}"
 
-        print(f"[확인] 기준 호스트: {self.base_netloc}")
-        if response.url != candidate:
-            print(f"[확인] 시작 URL 리다이렉트: {candidate} -> {response.url}")
+    def wait_for_request_slot(self) -> None:
+        with self.rate_lock:
+            now = time.monotonic()
+            wait_seconds = max(0.0, self.next_request_at - now)
+            if wait_seconds:
+                time.sleep(wait_seconds)
 
-        self.load_robots()
+            request_started_at = time.monotonic()
+            self.next_request_at = request_started_at + self.request_delay
+
+    def initialize(self) -> FetchResult:
+        candidate = self.normalize_url(
+            self.ensure_scheme(self.original_start_url),
+            use_base_scheme=False,
+        )
+        if not candidate:
+            raise RuntimeError("시작 URL을 정규화할 수 없습니다.")
+
+        print(f"[확인] 시작 URL 연결: {candidate}")
+        current_url = candidate
+        visited_redirects: set[str] = set()
+        redirects: list[RedirectHop] = []
+
+        for _ in range(MAX_REDIRECTS + 1):
+            if current_url in visited_redirects:
+                raise RuntimeError(f"시작 URL 리다이렉트 순환 감지: {current_url}")
+            visited_redirects.add(current_url)
+
+            current_parts = urlsplit(current_url)
+            current_origin = f"{current_parts.scheme}://{current_parts.netloc.lower()}"
+            if current_origin != self.origin:
+                self.set_base_url(current_url)
+                self.load_robots()
+
+            if not self.robots_allows(current_url):
+                raise RuntimeError(f"시작 URL이 robots.txt에 의해 차단됨: {current_url}")
+
+            try:
+                self.wait_for_request_slot()
+                response = self.get_session().get(
+                    current_url,
+                    timeout=self.timeout,
+                    allow_redirects=False,
+                )
+            except requests.RequestException as exc:
+                raise RuntimeError(f"시작 URL에 연결할 수 없습니다: {exc}") from exc
+
+            location = response.headers.get("Location")
+            if response.status_code in REDIRECT_STATUS_CODES and location:
+                next_url = self.normalize_url(
+                    location,
+                    current_url,
+                    use_base_scheme=False,
+                )
+                if not next_url:
+                    raise RuntimeError(
+                        f"시작 URL 리다이렉트 대상을 정규화할 수 없습니다: {location}"
+                    )
+
+                redirects.append(
+                    RedirectHop(
+                        requested_url=current_url,
+                        final_url=next_url,
+                        status_code=response.status_code,
+                    )
+                )
+                print(
+                    f"[확인] 시작 URL 리다이렉트: "
+                    f"{current_url} -> {next_url} ({response.status_code})"
+                )
+                current_url = next_url
+                continue
+
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"시작 URL 응답이 HTTP 200이 아닙니다: "
+                    f"{response.status_code} {current_url}"
+                )
+
+            final_url = self.normalize_url(
+                response.url,
+                use_base_scheme=False,
+            )
+            if not final_url:
+                raise RuntimeError("최종 시작 URL을 정규화할 수 없습니다.")
+
+            self.set_base_url(final_url)
+            self.start_url = final_url
+            content_type = response.headers.get("Content-Type", "").lower()
+            text = response.text if "html" in content_type else None
+
+            print(f"[확인] 기준 호스트: {self.base_netloc}")
+            return FetchResult(
+                requested_url=candidate,
+                final_url=final_url,
+                status_code=response.status_code,
+                content_type=content_type,
+                text=text,
+                error=None,
+                x_robots_tag=response.headers.get("X-Robots-Tag", ""),
+                redirects=tuple(redirects),
+            )
+
+        raise RuntimeError(
+            f"시작 URL 리다이렉트가 {MAX_REDIRECTS}회를 초과했습니다."
+        )
 
     def load_robots(self) -> None:
+        self.robots = None
+        self.request_delay = self.configured_delay
+
         if not self.respect_robots:
             print("[robots] robots.txt 확인을 건너뜁니다.")
             return
@@ -287,6 +391,7 @@ class SitemapCrawler:
         parser.set_url(robots_url)
 
         try:
+            self.wait_for_request_slot()
             response = requests.get(
                 robots_url,
                 headers={"User-Agent": USER_AGENT},
@@ -296,12 +401,36 @@ class SitemapCrawler:
                 parser.parse(response.text.splitlines())
                 self.robots = parser
                 print(f"[robots] 적용: {robots_url}")
+
+                crawl_delay = parser.crawl_delay(USER_AGENT)
+                if crawl_delay is None:
+                    crawl_delay = parser.crawl_delay("*")
+                if crawl_delay is not None:
+                    self.request_delay = max(
+                        self.configured_delay,
+                        float(crawl_delay),
+                    )
+                    with self.rate_lock:
+                        self.next_request_at = max(
+                            self.next_request_at,
+                            time.monotonic() + self.request_delay,
+                        )
+                    print(
+                        f"[robots] 요청 간격 적용: "
+                        f"{self.request_delay:g}초"
+                    )
             else:
                 print(f"[robots] 응답 {response.status_code}, 제한 없이 진행")
         except requests.RequestException as exc:
             print(f"[robots] 확인 실패, 제한 없이 진행: {exc}")
 
-    def normalize_url(self, url: str, base_url: str | None = None) -> str | None:
+    def normalize_url(
+        self,
+        url: str,
+        base_url: str | None = None,
+        *,
+        use_base_scheme: bool = True,
+    ) -> str | None:
         if base_url:
             url = urljoin(base_url, url)
 
@@ -319,7 +448,7 @@ class SitemapCrawler:
             return None
 
         # 같은 호스트의 HTTP 링크는 시작 URL의 HTTPS/HTTP 기준으로 통일
-        if self.base_host and hostname == self.base_host:
+        if use_base_scheme and self.base_host and hostname == self.base_host:
             scheme = self.base_scheme
 
         port = parts.port
@@ -348,20 +477,24 @@ class SitemapCrawler:
         return urlunsplit((scheme, netloc, path, query, ""))
 
     def is_internal(self, url: str) -> bool:
-        hostname = (urlsplit(url).hostname or "").lower()
-        if hostname == self.base_host:
-            return True
-        if self.allow_subdomains and hostname.endswith("." + self.base_host):
-            return True
-        return False
+        parts = urlsplit(url)
+        return (
+            parts.scheme.lower() == self.base_scheme
+            and (parts.hostname or "").lower() == self.base_host
+            and parts.netloc.lower() == self.base_netloc
+        )
 
     def path_exclusion_reason(self, url: str) -> str | None:
         parts = urlsplit(url)
         path_lower = parts.path.lower()
 
-        for prefix in self.exclude_paths:
-            if path_lower.startswith(prefix):
-                return f"제외 경로: {prefix}"
+        for excluded_path in self.exclude_paths:
+            if (
+                excluded_path == "/"
+                or path_lower == excluded_path
+                or path_lower.startswith(excluded_path + "/")
+            ):
+                return f"제외 경로: {excluded_path}"
 
         suffix = Path(path_lower).suffix
         if suffix in ASSET_EXTENSIONS:
@@ -371,19 +504,23 @@ class SitemapCrawler:
             if pattern.search(path_lower):
                 return f"제외 패턴: {pattern.pattern}"
 
-        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        query = {
+            key.lower(): value
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        }
 
         # 빈 상품번호와 같이 명백히 잘못된 동적 URL
         if path_lower.endswith("/goods/goods_view.php"):
-            goods_no = query.get("goodsNo")
-            if goods_no is None:
-                goods_no = query.get("goodsno")
+            goods_no = query.get("goodsno")
             if not goods_no:
                 return "상품번호(goodsNo)가 비어 있음"
 
         return None
 
     def sitemap_exclusion_reason(self, url: str) -> str | None:
+        if len(url) >= 2048:
+            return "사이트맵 URL 길이 제한(2,048자) 초과"
+
         parts = urlsplit(url)
         query_pairs = parse_qsl(parts.query, keep_blank_values=True)
 
@@ -404,28 +541,96 @@ class SitemapCrawler:
         return self.robots.can_fetch(USER_AGENT, url)
 
     def fetch(self, url: str) -> FetchResult:
-        if not self.robots_allows(url):
-            return FetchResult(
-                requested_url=url,
-                final_url=url,
-                status_code=None,
-                content_type="",
-                text=None,
-                error="robots.txt 차단",
-            )
+        current_url = url
+        visited_redirects: set[str] = set()
+        redirects: list[RedirectHop] = []
 
-        try:
-            response = self.get_session().get(
-                url,
-                timeout=self.timeout,
-                allow_redirects=True,
-            )
-            if self.delay:
-                time.sleep(self.delay)
+        for _ in range(MAX_REDIRECTS + 1):
+            if current_url in visited_redirects:
+                return FetchResult(
+                    requested_url=url,
+                    final_url=current_url,
+                    status_code=None,
+                    content_type="",
+                    text=None,
+                    error="리다이렉트 순환 감지",
+                    redirects=tuple(redirects),
+                )
+            visited_redirects.add(current_url)
+
+            if not self.robots_allows(current_url):
+                return FetchResult(
+                    requested_url=url,
+                    final_url=current_url,
+                    status_code=None,
+                    content_type="",
+                    text=None,
+                    error="robots.txt 차단",
+                    redirects=tuple(redirects),
+                )
+
+            try:
+                self.wait_for_request_slot()
+                response = self.get_session().get(
+                    current_url,
+                    timeout=self.timeout,
+                    allow_redirects=False,
+                )
+            except requests.RequestException as exc:
+                return FetchResult(
+                    requested_url=url,
+                    final_url=current_url,
+                    status_code=None,
+                    content_type="",
+                    text=None,
+                    error=str(exc),
+                    redirects=tuple(redirects),
+                )
+
+            location = response.headers.get("Location")
+            if response.status_code in REDIRECT_STATUS_CODES and location:
+                next_url = self.normalize_url(
+                    location,
+                    current_url,
+                    use_base_scheme=False,
+                )
+                if not next_url:
+                    return FetchResult(
+                        requested_url=url,
+                        final_url=current_url,
+                        status_code=response.status_code,
+                        content_type="",
+                        text=None,
+                        error=f"리다이렉트 대상 정규화 실패: {location}",
+                        redirects=tuple(redirects),
+                    )
+
+                redirects.append(
+                    RedirectHop(
+                        requested_url=current_url,
+                        final_url=next_url,
+                        status_code=response.status_code,
+                    )
+                )
+                current_url = next_url
+
+                if (
+                    not self.is_internal(current_url)
+                    or self.path_exclusion_reason(current_url)
+                ):
+                    return FetchResult(
+                        requested_url=url,
+                        final_url=current_url,
+                        status_code=response.status_code,
+                        content_type="",
+                        text=None,
+                        error=None,
+                        redirects=tuple(redirects),
+                    )
+                continue
 
             content_type = response.headers.get("Content-Type", "").lower()
             text = response.text if "html" in content_type else None
-
             return FetchResult(
                 requested_url=url,
                 final_url=response.url,
@@ -433,31 +638,48 @@ class SitemapCrawler:
                 content_type=content_type,
                 text=text,
                 error=None,
+                x_robots_tag=response.headers.get("X-Robots-Tag", ""),
+                redirects=tuple(redirects),
             )
-        except requests.RequestException as exc:
-            return FetchResult(
-                requested_url=url,
-                final_url=url,
-                status_code=None,
-                content_type="",
-                text=None,
-                error=str(exc),
-            )
+
+        return FetchResult(
+            requested_url=url,
+            final_url=current_url,
+            status_code=None,
+            content_type="",
+            text=None,
+            error=f"리다이렉트가 {MAX_REDIRECTS}회를 초과함",
+            redirects=tuple(redirects),
+        )
 
     @staticmethod
     def get_meta_robots(soup: BeautifulSoup) -> str:
         values: list[str] = []
-        for name in ("robots", "googlebot", "yeti"):
-            tag = soup.find("meta", attrs={"name": re.compile(f"^{name}$", re.I)})
-            if tag and tag.get("content"):
-                values.append(str(tag.get("content")).lower())
+        supported_names = {"robots", "googlebot", "yeti"}
+
+        for tag in soup.select("meta[name][content]"):
+            name = str(tag.get("name", "")).strip().lower()
+            if name in supported_names:
+                values.append(str(tag.get("content", "")).strip().lower())
+
         return ",".join(values)
+
+    @staticmethod
+    def has_noindex(*directive_values: str) -> bool:
+        combined = ",".join(directive_values).lower()
+        return bool(
+            re.search(r"(?:^|[\s,])(?:noindex|none)(?=$|[\s,])", combined)
+        )
 
     def extract_canonical(self, soup: BeautifulSoup, page_url: str) -> str | None:
         tag = soup.select_one('link[rel~="canonical" i]')
         if not tag or not tag.get("href"):
             return None
-        return self.normalize_url(str(tag.get("href")), page_url)
+        return self.normalize_url(
+            str(tag.get("href")),
+            page_url,
+            use_base_scheme=False,
+        )
 
     def extract_links(self, soup: BeautifulSoup, page_url: str) -> set[str]:
         links: set[str] = set()
@@ -489,26 +711,38 @@ class SitemapCrawler:
     def process_result(self, result: FetchResult) -> set[str]:
         requested = result.requested_url
 
+        for redirect in result.redirects:
+            self.redirect_rows.append(
+                {
+                    "requested_url": redirect.requested_url,
+                    "final_url": redirect.final_url,
+                    "status": str(redirect.status_code),
+                }
+            )
+
         if result.error:
             if result.error == "robots.txt 차단":
                 self.excluded_rows.append(
                     {
                         "source_url": requested,
-                        "url": requested,
+                        "url": result.final_url,
                         "reason": result.error,
                     }
                 )
             else:
                 self.broken_rows.append(
                     {
-                        "url": requested,
+                        "url": result.final_url,
                         "status": "",
                         "error": result.error,
                     }
                 )
             return set()
 
-        final_url = self.normalize_url(result.final_url)
+        final_url = self.normalize_url(
+            result.final_url,
+            use_base_scheme=False,
+        )
         if not final_url:
             self.broken_rows.append(
                 {
@@ -519,21 +753,23 @@ class SitemapCrawler:
             )
             return set()
 
-        if requested != final_url:
-            self.redirect_rows.append(
-                {
-                    "requested_url": requested,
-                    "final_url": final_url,
-                    "status": str(result.status_code or ""),
-                }
-            )
-
         if not self.is_internal(final_url):
             self.excluded_rows.append(
                 {
                     "source_url": requested,
                     "url": final_url,
                     "reason": "외부 호스트로 리다이렉트",
+                }
+            )
+            return set()
+
+        final_path_reason = self.path_exclusion_reason(final_url)
+        if final_path_reason:
+            self.excluded_rows.append(
+                {
+                    "source_url": requested,
+                    "url": final_url,
+                    "reason": final_path_reason,
                 }
             )
             return set()
@@ -562,12 +798,17 @@ class SitemapCrawler:
         discovered = self.extract_links(soup, final_url)
 
         meta_robots = self.get_meta_robots(soup)
-        if "noindex" in meta_robots:
+        if self.has_noindex(meta_robots, result.x_robots_tag):
+            robots_directives = ", ".join(
+                value
+                for value in (meta_robots, result.x_robots_tag.lower())
+                if value
+            )
             self.excluded_rows.append(
                 {
                     "source_url": requested,
                     "url": final_url,
-                    "reason": f"meta robots noindex: {meta_robots}",
+                    "reason": f"robots noindex: {robots_directives}",
                 }
             )
             return discovered
@@ -623,10 +864,11 @@ class SitemapCrawler:
         return discovered
 
     def crawl(self) -> None:
-        self.initialize()
-
-        queue: deque[str] = deque([self.start_url])
-        self.queued.add(self.start_url)
+        initial_result = self.initialize()
+        self.seen.add(self.start_url)
+        initial_links = self.process_result(initial_result)
+        queue: deque[str] = deque(sorted(initial_links))
+        self.queued.update(initial_links)
 
         print(
             f"[시작] 최대 {self.max_pages:,}개 페이지, "
@@ -687,7 +929,7 @@ class SitemapCrawler:
 
                     discovered = self.process_result(result)
 
-                    for link in discovered:
+                    for link in sorted(discovered):
                         if link not in self.seen and link not in self.queued:
                             queue.append(link)
                             self.queued.add(link)
@@ -725,6 +967,10 @@ class SitemapCrawler:
         tree = ET.ElementTree(root)
         self.indent_xml(tree)
         tree.write(path, encoding="utf-8", xml_declaration=True)
+        if path.stat().st_size > MAX_SITEMAP_BYTES:
+            raise RuntimeError(
+                f"사이트맵 파일이 50MB 제한을 초과했습니다: {path.name}"
+            )
 
     def write_sitemap_index(self, filenames: list[str], path: Path) -> None:
         namespace = "http://www.sitemaps.org/schemas/sitemap/0.9"
@@ -739,6 +985,39 @@ class SitemapCrawler:
         tree = ET.ElementTree(root)
         self.indent_xml(tree)
         tree.write(path, encoding="utf-8", xml_declaration=True)
+        if path.stat().st_size > MAX_SITEMAP_BYTES:
+            raise RuntimeError(
+                f"사이트맵 index가 50MB 제한을 초과했습니다: {path.name}"
+            )
+
+    @staticmethod
+    def split_sitemap_urls(urls: list[str]) -> list[list[str]]:
+        chunks: list[list[str]] = [[]]
+        chunk_bytes = 512
+
+        for url in urls:
+            escaped_url = xml_escape(url)
+            entry_bytes = len(
+                (
+                    "  <url>\n"
+                    f"    <loc>{escaped_url}</loc>\n"
+                    "  </url>\n"
+                ).encode("utf-8")
+            )
+            current_chunk = chunks[-1]
+
+            if current_chunk and (
+                len(current_chunk) >= MAX_SITEMAP_URLS
+                or chunk_bytes + entry_bytes > SITEMAP_CHUNK_BYTES
+            ):
+                chunks.append([])
+                current_chunk = chunks[-1]
+                chunk_bytes = 512
+
+            current_chunk.append(url)
+            chunk_bytes += entry_bytes
+
+        return chunks
 
     @staticmethod
     def write_csv(path: Path, rows: list[dict[str, str]], fieldnames: list[str]) -> None:
@@ -751,21 +1030,24 @@ class SitemapCrawler:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         urls = sorted(self.sitemap_urls)
-        chunk_size = 45000
+        chunks = self.split_sitemap_urls(urls)
 
-        if len(urls) <= chunk_size:
-            self.write_sitemap_file(urls, self.output_dir / "sitemap.xml")
-            sitemap_files = ["sitemap.xml"]
+        if len(chunks) == 1:
+            self.write_sitemap_file(chunks[0], self.output_dir / "sitemap.xml")
+            generated_sitemap_files = ["sitemap.xml"]
         else:
-            sitemap_files = []
-            for index in range(0, len(urls), chunk_size):
-                chunk = urls[index:index + chunk_size]
-                filename = f"sitemap-{index // chunk_size + 1}.xml"
+            chunk_filenames = []
+            for index, chunk in enumerate(chunks, start=1):
+                filename = f"sitemap-{index}.xml"
                 self.write_sitemap_file(chunk, self.output_dir / filename)
-                sitemap_files.append(filename)
+                chunk_filenames.append(filename)
 
             # 루트에 올릴 파일 이름을 sitemap.xml로 유지
-            self.write_sitemap_index(sitemap_files, self.output_dir / "sitemap.xml")
+            self.write_sitemap_index(
+                chunk_filenames,
+                self.output_dir / "sitemap.xml",
+            )
+            generated_sitemap_files = ["sitemap.xml", *chunk_filenames]
 
         self.write_csv(
             self.output_dir / "excluded_urls.csv",
@@ -797,7 +1079,7 @@ class SitemapCrawler:
             f"오류 URL: {len(self.broken_rows):,}\n"
             f"리다이렉트: {len(self.redirect_rows):,}\n"
             f"canonical 불일치: {len(self.canonical_rows):,}\n"
-            f"생성 파일: {', '.join(sitemap_files)}\n"
+            f"생성 파일: {', '.join(generated_sitemap_files)}\n"
         )
         (self.output_dir / "summary.txt").write_text(summary, encoding="utf-8")
 
@@ -842,17 +1124,12 @@ def parse_args() -> argparse.Namespace:
         "--delay",
         type=float,
         default=0.05,
-        help="각 요청 후 대기 시간(초). 기본값: 0.05",
+        help="전체 요청 사이의 최소 간격(초). 기본값: 0.05",
     )
     parser.add_argument(
         "--ignore-robots",
         action="store_true",
         help="robots.txt 규칙을 무시합니다.",
-    )
-    parser.add_argument(
-        "--allow-subdomains",
-        action="store_true",
-        help="시작 호스트의 하위 도메인도 내부 URL로 취급합니다.",
     )
     parser.add_argument(
         "--include-page-urls",
@@ -885,7 +1162,6 @@ def main() -> int:
         timeout=max(1.0, args.timeout),
         delay=max(0.0, args.delay),
         respect_robots=not args.ignore_robots,
-        allow_subdomains=args.allow_subdomains,
         include_page_urls=args.include_page_urls,
         extra_exclude_paths=args.exclude,
     )

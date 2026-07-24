@@ -2,6 +2,11 @@
 param()
 
 $ErrorActionPreference = "Stop"
+$utf8Encoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::InputEncoding = $utf8Encoding
+[Console]::OutputEncoding = $utf8Encoding
+$OutputEncoding = $utf8Encoding
+$env:PYTHONUTF8 = "1"
 
 $projectRoot = $PSScriptRoot
 $venvPath = Join-Path $projectRoot ".venv"
@@ -12,7 +17,7 @@ $generatorPath = Join-Path $projectRoot "sitemap_generator.py"
 Set-Location -LiteralPath $projectRoot
 
 if (-not (Test-Path -LiteralPath $venvPython)) {
-    Write-Host "[준비] Python 가상환경을 생성합니다."
+    Write-Host "[setup] Creating a Python virtual environment."
 
     $pyLauncher = Get-Command "py" -ErrorAction SilentlyContinue
     if ($pyLauncher) {
@@ -21,26 +26,26 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
     else {
         $pythonLauncher = Get-Command "python" -ErrorAction SilentlyContinue
         if (-not $pythonLauncher) {
-            throw "Python을 찾을 수 없습니다. Python 3.10 이상을 설치한 뒤 다시 실행해 주세요."
+            throw "Python was not found. Install Python 3.10 or later and try again."
         }
         & $pythonLauncher.Source -m venv $venvPath
     }
 
     if ($LASTEXITCODE -ne 0) {
-        throw "Python 가상환경 생성에 실패했습니다."
+        throw "Failed to create the Python virtual environment."
     }
 }
 
 & $venvPython -c "import requests, bs4" 2>$null
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "[준비] 필요한 Python 패키지를 설치합니다."
+    Write-Host "[setup] Installing required Python packages."
     & $venvPython -m pip install -r $requirementsPath
 
     if ($LASTEXITCODE -ne 0) {
-        throw "Python 패키지 설치에 실패했습니다."
+        throw "Failed to install the required Python packages."
     }
 }
 
-Write-Host "[실행] 사이트 주소를 입력하면 사이트맵 생성을 시작합니다."
+Write-Host "[run] Enter a website address to generate its sitemap."
 & $venvPython $generatorPath
 exit $LASTEXITCODE
