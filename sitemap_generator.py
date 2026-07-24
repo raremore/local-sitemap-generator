@@ -454,12 +454,7 @@ class SitemapCrawler:
         return ",".join(values)
 
     def extract_canonical(self, soup: BeautifulSoup, page_url: str) -> str | None:
-        tag = soup.find(
-            "link",
-            attrs={"rel": lambda value: value and "canonical" in [
-                str(item).lower() for item in (value if isinstance(value, list) else [value])
-            ]},
-        )
+        tag = soup.select_one('link[rel~="canonical" i]')
         if not tag or not tag.get("href"):
             return None
         return self.normalize_url(str(tag.get("href")), page_url)
