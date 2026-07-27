@@ -140,6 +140,7 @@ SKIP_PATH_PATTERNS = (
     re.compile(r"(?:_ps|_proc)\.php$", re.I),
     re.compile(r"/board/(?:write|modify|delete)\.php$", re.I),
     re.compile(r"/goods/goods_search\.php$", re.I),
+    re.compile(r"/logout(?:\.[a-z0-9]+)?/?$", re.I),
 )
 
 

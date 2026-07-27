@@ -19,6 +19,7 @@ Developed by raremore at RE:CODER Labs.
 ## 요구 사항
 
 - Windows
+- [PowerShell 7 (`pwsh`)](https://learn.microsoft.com/powershell/scripting/install/install-powershell-on-windows) 권장 또는 Windows PowerShell 5.1
 - Python 3.10 이상
 - 인터넷 연결
 
@@ -39,8 +40,9 @@ PowerShell에서 프로젝트 폴더로 이동한 다음 실행합니다.
 `pw_run.ps1`은 다음 작업을 자동으로 처리합니다.
 
 1. `.venv` 가상환경이 없으면 생성
-2. 필요한 Python 패키지가 없으면 `requirements.txt`로 설치
-3. 사이트맵 생성기 실행
+2. 필요한 Python 패키지가 없으면 `pip`를 최신 버전으로 업그레이드
+3. `requirements.txt`에 정의된 Python 패키지 설치
+4. 사이트맵 생성기 실행
 
 PowerShell 실행 정책 때문에 스크립트 실행이 차단되면 다음 명령을 사용합니다.
 
@@ -116,6 +118,7 @@ python sitemap_generator.py --help
 
 - `/admin/`, `/config/`, `/module/`, `/tmp/`
 - `/member/`, `/mypage/`, `/order/`, 인증 관련 경로
+- `/logout`, `/logout.cm`, `/logout.php` 등의 로그아웃 액션
 - 이미지, 동영상, 문서, 압축 파일 등의 정적·다운로드 파일
 - 상품번호가 비어 있는 상품 URL
 - `noindex` 페이지

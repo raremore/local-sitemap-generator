@@ -38,6 +38,13 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
 
 & $venvPython -c "import requests, bs4" 2>$null
 if ($LASTEXITCODE -ne 0) {
+    Write-Host "[setup] Upgrading pip."
+    & $venvPython -m pip install --upgrade pip
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to upgrade pip."
+    }
+
     Write-Host "[setup] Installing required Python packages."
     & $venvPython -m pip install -r $requirementsPath
 
@@ -46,6 +53,7 @@ if ($LASTEXITCODE -ne 0) {
     }
 }
 
+Write-Host
 Write-Host "[run] Enter a website address to generate its sitemap."
 & $venvPython $generatorPath
 exit $LASTEXITCODE
