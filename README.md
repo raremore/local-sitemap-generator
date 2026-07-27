@@ -19,8 +19,8 @@ Developed by raremore at RE:CODER Labs.
 ## 요구 사항
 
 - Windows
-- [PowerShell 7 (`pwsh`)](https://learn.microsoft.com/powershell/scripting/install/install-powershell-on-windows) 권장 또는 Windows PowerShell 5.1
-- Python 3.10 이상
+- [PowerShell 7](https://learn.microsoft.com/powershell/scripting/install/install-powershell-on-windows) 권장 또는 Windows PowerShell 5.1
+- [Python 3.10](https://www.python.org) 이상
 - 인터넷 연결
 
 ## 가장 간단한 실행 방법
