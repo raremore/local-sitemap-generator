@@ -25,7 +25,9 @@ Developed by raremore at RE:CODER Labs.
 
 ## 가장 간단한 실행 방법
 
-PowerShell에서 프로젝트 폴더로 이동한 다음 실행합니다.
+파일 탐색기에서 `run.cmd`를 더블클릭하는 것이 가장 간단합니다. PowerShell 7이 설치되어 있으면 `pwsh`를 사용하고, 없으면 Windows PowerShell로 실행합니다. 실행이 끝나거나 오류가 발생해도 마지막 키 입력 전까지 창을 유지합니다.
+
+PowerShell에서 직접 실행하려면 프로젝트 폴더로 이동한 다음 실행합니다.
 
 ```powershell
 .\pw_run.ps1
@@ -48,6 +50,12 @@ PowerShell 실행 정책 때문에 스크립트 실행이 차단되면 다음 �
 
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -File .\pw_run.ps1
+```
+
+터미널에서 실행한 뒤 대기하지 않고 바로 종료하려면 다음 옵션을 사용합니다.
+
+```powershell
+.\pw_run.ps1 -NoPause
 ```
 
 ## Python으로 직접 실행

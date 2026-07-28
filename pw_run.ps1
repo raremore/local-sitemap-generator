@@ -1,7 +1,29 @@
 [CmdletBinding()]
-param()
+param(
+    [switch]$NoPause
+)
 
 $ErrorActionPreference = "Stop"
+
+function Stop-Script {
+    param(
+        [int]$ExitCode
+    )
+
+    if (-not $NoPause) {
+        Write-Host
+        Read-Host "[exit] Press Enter to close this window" | Out-Null
+    }
+
+    exit $ExitCode
+}
+
+trap {
+    Write-Host
+    Write-Host "[error] $($_.Exception.Message)" -ForegroundColor Red
+    Stop-Script -ExitCode 1
+}
+
 $utf8Encoding = [System.Text.UTF8Encoding]::new($false)
 [Console]::InputEncoding = $utf8Encoding
 [Console]::OutputEncoding = $utf8Encoding
@@ -56,4 +78,5 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host
 Write-Host "[run] Enter a website address to generate its sitemap."
 & $venvPython $generatorPath
-exit $LASTEXITCODE
+$generatorExitCode = $LASTEXITCODE
+Stop-Script -ExitCode $generatorExitCode
