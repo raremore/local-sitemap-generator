@@ -13,7 +13,7 @@ Developed by raremore at RE:CODER Labs.
 - 관리자, 회원, 주문 및 정적 파일 경로 자동 제외
 - 실제 HTTP 상태 코드가 포함된 리다이렉트 이력 CSV 생성
 - 제외 URL, 오류 URL, canonical 불일치 CSV 생성
-- URL 25,000개 또는 파일 용량 10MB에 도달하면 sitemap 자동 분할
+- URL 10,000개 또는 파일 용량 10MB에 도달하면 sitemap 자동 분할
 - `robots.txt`와 `Crawl-delay` 규칙 적용
 
 ## 요구 사항
