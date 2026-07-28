@@ -50,8 +50,8 @@ from urllib3.util.retry import Retry
 USER_AGENT = "LocalSitemapGenerator/1.0 (+SEO audit; local desktop tool)"
 REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 MAX_REDIRECTS = 10
-MAX_SITEMAP_URLS = 45000
-SITEMAP_CHUNK_BYTES = 45 * 1024 * 1024
+MAX_SITEMAP_URLS = 25000
+SITEMAP_CHUNK_BYTES = 10 * 1024 * 1024
 MAX_SITEMAP_BYTES = 50 * 1024 * 1024
 
 # URL 정규화 단계에서 제거할 추적/표시용 파라미터
